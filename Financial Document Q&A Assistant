@@ -1,0 +1,383 @@
+"""
+Streamlit Financial Document Q&A
+--------------------------------
+Single-file Streamlit app that:
+- Accepts PDF and Excel uploads (income statement, balance sheet, cashflow)
+- Extracts text and tables using pdfplumber and pandas
+- Builds a concise structured context (key metrics + tables)
+- Sends user questions + context to a local Ollama SLM via HTTP API
+- Provides an interactive conversational UI with follow-up support
+
+Usage:
+1. Install dependencies from requirements.txt
+2. Start Ollama and run a compatible model locally (see Ollama docs)
+3. Run: streamlit run streamlit_finance_qa.py
+
+Notes:
+- This app tries to be robust to many layouts but cannot guarantee extraction for every PDF. For best results, upload machine-readable PDFs (not scanned images). For scanned docs, add OCR (e.g., Tesseract) as an enhancement.
+- Keep the context short; the app truncates long documents to avoid model input limits.
+"""
+
+import streamlit as st
+import io
+import re
+import json
+import requests
+from typing import List, Dict, Tuple, Any
+
+import pandas as pd
+import pdfplumber
+
+# ---------- CONFIG ----------
+OLLAMA_API_URL = "http://127.0.0.1:11434/api/generate"  # default Ollama local API endpoint
+OLLAMA_MODEL = "llama2"  # change to your local SLM model name
+MAX_CONTEXT_CHARS = 40_000  # approximate truncation target for prompt context
+
+# ---------- UTILITIES: Extraction ----------
+
+def extract_text_from_pdf(file_bytes: bytes) -> str:
+    """Extracts concatenated text from a PDF using pdfplumber."""
+    text_chunks = []
+    try:
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            for page in pdf.pages:
+                txt = page.extract_text()
+                if txt:
+                    text_chunks.append(txt)
+    except Exception as e:
+        st.warning(f"PDF parsing error: {e}")
+    return "\n\n".join(text_chunks)
+
+
+def extract_tables_from_pdf(file_bytes: bytes) -> List[pd.DataFrame]:
+    """Attempt to extract tables from PDF pages. Returns a list of DataFrames."""
+    tables = []
+    try:
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            for page in pdf.pages:
+                try:
+                    page_tables = page.extract_tables()
+                    for tbl in page_tables:
+                        # Convert table (list of lists) into DataFrame, try to handle header rows
+                        if not tbl:
+                            continue
+                        df = pd.DataFrame(tbl)
+                        # Try to clean empty columns/rows
+                        df = df.dropna(how="all", axis=0).dropna(how="all", axis=1)
+                        if df.shape[0] >= 1 and df.shape[1] >= 1:
+                            tables.append(df)
+                except Exception:
+                    continue
+    except Exception as e:
+        st.warning(f"PDF table extraction error: {e}")
+    return tables
+
+
+def extract_from_excel(file_bytes: bytes) -> Dict[str, pd.DataFrame]:
+    """Reads Excel file into dict of DataFrames (sheet_name -> df)."""
+    sheets = {}
+    try:
+        xls = pd.ExcelFile(io.BytesIO(file_bytes))
+        for sheet in xls.sheet_names:
+            try:
+                df = xls.parse(sheet, header=None)
+                df = df.dropna(how="all", axis=0).dropna(how="all", axis=1)
+                sheets[sheet] = df
+            except Exception:
+                continue
+    except Exception as e:
+        st.warning(f"Excel parsing error: {e}")
+    return sheets
+
+
+# ---------- UTILITIES: Financial Parsing ----------
+
+METRIC_KEYWORDS = {
+    "revenue": [r"total revenue", r"revenues?", r"net sales", r"sales"],
+    "cost_of_goods_sold": [r"cost of goods sold", r"cogs", r"cost of sales"],
+    "gross_profit": [r"gross profit"],
+    "operating_expenses": [r"operating expenses", r"opex"],
+    "operating_income": [r"operating income", r"operating profit"],
+    "net_income": [r"net income", r"net profit", r"profit for the year"],
+    "total_assets": [r"total assets"],
+    "total_liabilities": [r"total liabilities"],
+    "cash_from_operations": [r"cash from operating activities", r"net cash provided by operating activities"],
+}
+
+
+number_re = re.compile(r"[-+]?\$?\(?[0-9\,\.]+\)?")
+
+
+def normalize_number(s: str) -> str:
+    """Convert extracted numeric-like string to a cleaner form (keep as string to avoid locale issues)."""
+    if not isinstance(s, str):
+        s = str(s)
+    s = s.replace('\u00a0', ' ')
+    m = number_re.search(s)
+    if not m:
+        return ""
+    raw = m.group(0)
+    # Remove currency symbols and parentheses -> keep minus sign for negative
+    negative = '(' in raw and ')' in raw
+    cleaned = re.sub(r"[^0-9\.\-]", "", raw)
+    if negative and not cleaned.startswith('-'):
+        cleaned = '-' + cleaned
+    return cleaned
+
+
+def search_metrics_in_text(text: str) -> Dict[str, List[str]]:
+    """Find metric lines in free text; returns metric -> list of matched numeric strings."""
+    results = {k: [] for k in METRIC_KEYWORDS.keys()}
+    lowered = text.lower()
+    lines = [l.strip() for l in lowered.splitlines() if l.strip()]
+    for i, line in enumerate(lines):
+        for metric, kwlist in METRIC_KEYWORDS.items():
+            for kw in kwlist:
+                if re.search(rf"\b{kw}\b", line):
+                    num = normalize_number(line)
+                    if num:
+                        results[metric].append(num)
+                    else:
+                        # look ahead for numbers in next 2 lines
+                        for j in range(1, 3):
+                            if i+j < len(lines):
+                                num2 = normalize_number(lines[i+j])
+                                if num2:
+                                    results[metric].append(num2)
+    return results
+
+
+def search_metrics_in_tables(tables: List[pd.DataFrame]) -> Dict[str, List[str]]:
+    results = {k: [] for k in METRIC_KEYWORDS.keys()}
+    for df in tables:
+        try:
+            # Convert all cells to string for regex searches
+            dstr = df.astype(str)
+            for r in range(dstr.shape[0]):
+                for c in range(dstr.shape[1]):
+                    cell = str(dstr.iat[r, c]).lower()
+                    for metric, kwlist in METRIC_KEYWORDS.items():
+                        for kw in kwlist:
+                            if kw in cell:
+                                # try to find a numeric in the row or nearby columns
+                                # scan the row for any numeric-like cells
+                                row_vals = [normalize_number(str(dstr.iat[r, cc])) for cc in range(dstr.shape[1])]
+                                row_vals = [v for v in row_vals if v]
+                                if row_vals:
+                                    results[metric].extend(row_vals)
+                                else:
+                                    # check neighboring rows same column
+                                    for rr in [r-1, r+1]:
+                                        if 0 <= rr < dstr.shape[0]:
+                                            val = normalize_number(str(dstr.iat[rr, c]))
+                                            if val:
+                                                results[metric].append(val)
+        except Exception:
+            continue
+    return results
+
+
+def summarize_extracted(sources: Dict[str, Any], max_chars=MAX_CONTEXT_CHARS) -> str:
+    """Create a concise textual context summarizing extracted text and metric candidates."""
+    pieces = []
+    if 'text' in sources and sources['text']:
+        t = sources['text']
+        # Keep the first and last 2000 chars to capture headings + footers
+        head = t[:2000]
+        tail = t[-2000:]
+        pieces.append("DOCUMENT_TEXT_HEAD:\n" + head)
+        if len(t) > 4000:
+            pieces.append("...<SNIPPED>...")
+        pieces.append("DOCUMENT_TEXT_TAIL:\n" + tail)
+    # Add metric candidates
+    if 'metrics_text' in sources:
+        pieces.append("METRICS_FROM_TEXT:\n" + json.dumps(sources['metrics_text'], indent=2))
+    if 'metrics_tables' in sources:
+        pieces.append("METRICS_FROM_TABLES:\n" + json.dumps(sources['metrics_tables'], indent=2))
+    # Add simple table summaries
+    if 'tables' in sources and sources['tables']:
+        tbl_summaries = []
+        for i, df in enumerate(sources['tables'][:5]):
+            summary = f"Table_{i}: shape={df.shape}, cols={list(df.iloc[0].astype(str).tolist()[:6])}"
+            tbl_summaries.append(summary)
+        pieces.append("TABLE_SUMMARIES:\n" + "\n".join(tbl_summaries))
+
+    context = "\n\n".join(pieces)
+    if len(context) > max_chars:
+        context = context[:max_chars] + "\n\n...<CONTEXT_TRUNCATED>..."
+    return context
+
+
+# ---------- LLM Interaction (Ollama) ----------
+
+def build_prompt(question: str, context_text: str, chat_history: List[Tuple[str, str]] = None) -> str:
+    """Compose a prompt for the LLM that includes a short context and the user's question. Chat history is included for follow-ups."""
+    primer = (
+        "You are a helpful financial data assistant. Use ONLY the provided document context and tables to answer questions about financial metrics (revenue, expenses, profits, cash flows, assets, liabilities, etc.).\n"
+        "If a metric is not present in the provided context, say you couldn't find it and suggest what to look for (e.g., 'Total Revenue', 'Net income', 'Cash from operating activities').\n"
+        "When you present numbers, include the unit if available and explain where you found them (text or table) and the exact matched phrase if available. Be concise.\n"
+    )
+    history_block = ""
+    if chat_history:
+        for user_msg, assistant_msg in chat_history[-6:]:
+            history_block += f"User: {user_msg}\nAssistant: {assistant_msg}\n"
+    prompt = primer + "\nDOCUMENT_CONTEXT:\n" + context_text + "\n\n" + history_block + f"\nUser Question: {question}\nAssistant:" 
+    # Keep prompt short
+    if len(prompt) > MAX_CONTEXT_CHARS:
+        prompt = prompt[-MAX_CONTEXT_CHARS:]
+    return prompt
+
+
+def call_ollama(prompt: str, model: str = OLLAMA_MODEL, max_tokens: int = 1024) -> str:
+    """Call local Ollama HTTP API's generate endpoint. Returns model text or raises an exception."""
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+        "stop": None
+    }
+    try:
+        resp = requests.post(OLLAMA_API_URL, json=payload, timeout=60)
+        resp.raise_for_status()
+        data = resp.json()
+        # Ollama's response format may vary by version. Common field: 'text' or 'choices'.
+        if 'text' in data:
+            return data['text']
+        if 'choices' in data and isinstance(data['choices'], list) and data['choices']:
+            return data['choices'][0].get('text', '')
+        # Fallback: return full JSON
+        return json.dumps(data)
+    except Exception as e:
+        raise RuntimeError(f"Error calling Ollama API: {e}")
+
+
+# ---------- STREAMLIT APP ----------
+
+st.set_page_config(page_title="FinanceDoc QA", layout="wide")
+st.title("📊 FinanceDoc Q&A — Local Streamlit + Ollama")
+
+st.markdown(
+    "Upload financial PDFs or Excel workbooks (income statement, balance sheet, cash flow). The app will extract text/tables and let you ask questions in natural language. This runs locally and uses a local Ollama SLM."
+)
+
+# Session state for chat and extracted content
+if 'chat' not in st.session_state:
+    st.session_state.chat = []  # list of (user, assistant)
+if 'context' not in st.session_state:
+    st.session_state.context = None
+if 'raw_tables' not in st.session_state:
+    st.session_state.raw_tables = []
+if 'raw_text' not in st.session_state:
+    st.session_state.raw_text = ''
+if 'sources' not in st.session_state:
+    st.session_state.sources = {}
+
+# ---- Sidebar: Upload ----
+with st.sidebar.form(key='upload_form'):
+    uploaded_files = st.file_uploader("Upload PDF or Excel files", accept_multiple_files=True, type=['pdf', 'xls', 'xlsx'])
+    model_name = st.text_input("Ollama model name", value=OLLAMA_MODEL)
+    submit = st.form_submit_button("Process documents")
+
+if submit:
+    all_text = []
+    all_tables = []
+    with st.spinner("Processing documents..."):
+        for f in uploaded_files:
+            content = f.read()
+            if f.type == 'application/pdf' or f.name.lower().endswith('.pdf'):
+                text = extract_text_from_pdf(content)
+                tables = extract_tables_from_pdf(content)
+                all_text.append(f"--- FILE: {f.name} ---\n" + (text or "(no text extracted)"))
+                all_tables.extend(tables)
+            else:
+                # Excel
+                sheets = extract_from_excel(content)
+                # Combine sheet texts
+                text_parts = []
+                for sname, df in sheets.items():
+                    text_parts.append(f"SHEET: {sname}\n" + df.astype(str).to_csv(index=False, header=False))
+                    all_tables.append(df)
+                all_text.append(f"--- FILE: {f.name} ---\n" + "\n".join(text_parts))
+
+        combined_text = "\n\n".join(all_text)
+        st.session_state.raw_text = combined_text
+        st.session_state.raw_tables = all_tables
+
+        # extract metric candidates
+        metrics_text = search_metrics_in_text(combined_text)
+        metrics_tables = search_metrics_in_tables(all_tables)
+
+        sources = {
+            'text': combined_text,
+            'tables': all_tables,
+            'metrics_text': metrics_text,
+            'metrics_tables': metrics_tables,
+        }
+        st.session_state.sources = sources
+        st.session_state.context = summarize_extracted(sources)
+    st.success("Processing complete — context ready for QA.")
+
+# ---- Main layout: left = chat, right = extracted info ----
+col1, col2 = st.columns([2, 1])
+
+with col1:
+    st.subheader("Ask questions")
+    question = st.text_input("Your question (e.g. 'What was total revenue for 2023?')", key='q_input')
+    if st.button("Ask") and question.strip():
+        if not st.session_state.context:
+            st.error("No documents processed yet. Upload PDF/Excel in the sidebar and click 'Process documents'.")
+        else:
+            # build prompt and call Ollama
+            try:
+                with st.spinner("Generating answer from local model..."):
+                    prompt = build_prompt(question.strip(), st.session_state.context, st.session_state.chat)
+                    model_to_use = model_name.strip() or OLLAMA_MODEL
+                    answer = call_ollama(prompt, model=model_to_use)
+                    # Save chat
+                    st.session_state.chat.append((question.strip(), answer))
+            except Exception as e:
+                st.error(str(e))
+
+    # show chat
+    if st.session_state.chat:
+        for user_msg, assistant_msg in reversed(st.session_state.chat[-30:]):
+            st.markdown(f"**You:** {user_msg}")
+            st.markdown(f"**Assistant:** {assistant_msg}")
+
+with col2:
+    st.subheader("Extracted summary & metrics")
+
+    if st.session_state.context:
+        st.markdown("**Document context (truncated):**")
+        st.code(st.session_state.context[:8000])
+
+    if st.session_state.sources:
+        st.markdown("**Candidate metrics found in text**")
+        st.json(st.session_state.sources.get('metrics_text', {}))
+        st.markdown("**Candidate metrics found in tables**")
+        st.json(st.session_state.sources.get('metrics_tables', {}))
+
+    if st.session_state.raw_tables:
+        st.markdown("**Top extracted tables (preview)**")
+        for i, df in enumerate(st.session_state.raw_tables[:3]):
+            st.write(f"Table {i} — shape={df.shape}")
+            # attempt to display as table if small
+            try:
+                # try to set header row if it seems like header exists
+                st.dataframe(df.head(12))
+            except Exception:
+                st.write(df.head(5))
+
+# ---- Footer: tips, error handling ----
+st.markdown("---")
+st.markdown(
+    "**Tips & Notes:**\n\n"
+    "- For scanned PDFs, integrate OCR (Tesseract) then feed the OCR text to the tool.\n"
+    "- If the model returns 'couldn't find', inspect the 'Extracted summary' panel to see detected labels and numbers.\n"
+    "- Adjust `OLLAMA_MODEL` in the sidebar to point to the model you ran locally.\n"
+)
+
+st.markdown("**Debug:** If Ollama API fails, ensure Ollama is running and reachable at the configured endpoint.")
+
+# ---------- END ----------
